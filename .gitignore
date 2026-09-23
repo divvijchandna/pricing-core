@@ -34,7 +34,7 @@ coverage.xml
 .vscode/
 *.swp
 
-# --- Market data: never commit real vendor data (CLAUDE.md rule 7) ---
+# --- Market data: never commit real vendor data ---
 data/bloomberg/
 **/bloomberg_data/
 *.blp
