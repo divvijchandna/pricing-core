@@ -1,0 +1,53 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pricing-core"
+version = "0.0.0"
+description = "Vectorised option pricing: Black-Scholes/Black-76, Greeks, implied vol, Monte Carlo, PDE."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=1.26",
+    "scipy>=1.11",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "pytest-cov>=5",
+    "ruff>=0.6",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pricing_core"]
+
+# --- ruff -----------------------------------------------------------------
+[tool.ruff]
+line-length = 88
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+# E/W pycodestyle, F pyflakes, I isort, B bugbear, UP pyupgrade, NPY numpy-specific.
+# pep8-naming (N) deliberately off: finance notation (S, K, T, r, q, sigma) is clearer
+# than snake_case long names and matches the formulas in the docstrings.
+select = ["E", "W", "F", "I", "B", "UP", "NPY"]
+
+# --- pytest ---------------------------------------------------------------
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+addopts = ["-ra", "--strict-markers", "--strict-config"]
+# Equivalent of `-W error`: any warning (e.g. numpy divide-by-zero / overflow /
+# invalid) fails the test instead of passing silently.
+filterwarnings = ["error"]
+markers = [
+    "slow: statistical / convergence tests (deselect with -m 'not slow')",
+]
+
+# --- coverage -------------------------------------------------------------
+[tool.coverage.run]
+source = ["pricing_core"]
+branch = true
