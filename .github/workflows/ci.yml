@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+  workflow_dispatch:
+
+# Least privilege: CI only needs to read the repo.
+permissions:
+  contents: read
+
+# A newer push to the same branch cancels the older, still-running run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -e ".[dev]"
+      - run: ruff check .
+      - run: ruff format --check .
+
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - run: pip install -e ".[dev]"
+
+      # Two mutually exclusive steps rather than one step with a computed `-m`
+      # expression: `cond && '' || 'not slow'` always yields 'not slow' in
+      # Actions, because '' is falsy.
+      - name: pytest (fast, non-main branches)
+        if: github.ref != 'refs/heads/main'
+        run: pytest -m "not slow" --cov --cov-report=term-missing
+
+      - name: pytest (full suite, main)
+        if: github.ref == 'refs/heads/main'
+        run: pytest --cov --cov-report=term-missing
