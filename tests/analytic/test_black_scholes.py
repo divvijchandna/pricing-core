@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 from scipy.stats import norm
 
-from pricing_core.analytic.black_scholes import black76_price, bs_price
+from pricing_core.analytic.black_scholes import black76_price, bs_price, d1_d2
 
 # --- helpers -----------------------------------------------------------------
 
@@ -190,3 +190,76 @@ def test_is_call_is_required_and_keyword_only():
         bs_price(100.0, 100.0, 1.0, 0.05, 0.0, 0.2)  # missing is_call
     with pytest.raises(TypeError):
         bs_price(100.0, 100.0, 1.0, 0.05, 0.0, 0.2, True)  # positional is_call
+
+
+# --- d1, d2 ------------------------------------------------------------------
+
+
+def test_d1_d2_match_formula(bs_grid):
+    g = bs_grid
+    S, K, T, r, q, sigma = (g[k] for k in ("S", "K", "T", "r", "q", "sigma"))
+    v = sigma * np.sqrt(T)
+    expected_d1 = (np.log(S / K) + (r - q + 0.5 * sigma**2) * T) / v
+    d1, d2 = d1_d2(**g)
+    np.testing.assert_allclose(d1, expected_d1, rtol=1e-12, atol=1e-12)
+    np.testing.assert_allclose(d1 - d2, v, rtol=1e-12)
+
+
+@pytest.mark.parametrize(("K", "expected"), [(90.0, np.inf), (110.0, -np.inf)])
+def test_d1_d2_zero_vol_limits_away_from_forward(K, expected):
+    # sigma = 0, r = q = 0, so P_S / P_K = S / K: ITM -> +inf, OTM -> -inf.
+    d1, d2 = d1_d2(100.0, K, 1.0, 0.0, 0.0, 0.0)
+    assert d1 == expected
+    assert d2 == expected
+
+
+def test_d1_d2_zero_vol_limit_at_forward_is_zero():
+    # d1 = -d2 = sigma sqrt(T) / 2 -> 0 at the forward; the legacy code gave NaN.
+    d1, d2 = d1_d2(100.0, 100.0, 1.0, 0.0, 0.0, 0.0)
+    assert d1 == 0.0
+    assert d2 == 0.0
+
+
+# --- invalid inputs: NaN, never an exception or warning ---------------------
+
+_VALID = {"S": 100.0, "K": 100.0, "T": 1.0, "r": 0.05, "q": 0.0, "sigma": 0.2}
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        {"S": 0.0},
+        {"S": -5.0},
+        {"K": 0.0},
+        {"K": -1.0},
+        {"T": -0.5},
+        {"sigma": -0.1},  # e.g. a vol-down stress larger than the vol itself
+        {"S": np.nan},
+        {"sigma": np.nan},
+        {"r": np.nan},
+        {"q": np.inf},
+        {"S": np.inf},
+    ],
+    ids=lambda bad: ",".join(f"{k}={v}" for k, v in bad.items()),
+)
+def test_invalid_inputs_give_nan(bad):
+    args = {**_VALID, **bad}
+    assert np.isnan(bs_price(**args, is_call=True))
+    assert np.isnan(bs_price(**args, is_call=False))
+    d1, d2 = d1_d2(**args)
+    assert np.isnan(d1)
+    assert np.isnan(d2)
+
+
+def test_black76_invalid_gives_nan():
+    assert np.isnan(black76_price(20.0, 20.0, 1.0, 0.05, -0.2, is_call=False))
+
+
+def test_invalid_element_leaves_others_unchanged():
+    K = np.array([90.0, 100.0, 110.0])
+    sigma = np.array([0.2, -0.1, 0.2])  # middle element invalid
+    prices = bs_price(100.0, K, 1.0, 0.05, 0.0, sigma, is_call=True)
+    assert np.isnan(prices[1])
+    for i in (0, 2):
+        alone = bs_price(100.0, K[i], 1.0, 0.05, 0.0, sigma[i], is_call=True)
+        np.testing.assert_allclose(prices[i], alone, rtol=1e-14)
