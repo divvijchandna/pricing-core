@@ -103,3 +103,124 @@ relative error is undefined there. I also keep monotonicity tests away from regi
 where doubles cannot resolve the change, rather than loosening the tolerance.
 Reference: Higham, Accuracy and Stability of Numerical Algorithms (2nd ed.),
 ch. 1-2 (floating-point error); numpy.testing.assert_allclose documentation.
+
+## Black-76 as bs_price with q = r: DRAFT
+Chose: `black76_price(F, K, T, r, sigma, *, is_call)` is one line,
+`bs_price(F, K, T, r, q=r, sigma=sigma, is_call=is_call)`.
+Alternatives considered: a separate Black-76 formula (two implementations to keep
+consistent); a generalised "cost of carry b" pricer (b = r - q for stocks, 0 for
+futures, r - r_f for FX), which is more general than anything Week 1 needs.
+Why: Black-Scholes depends on the underlying only through its prepaid forward,
+S e^(-qT). For a futures price that is F e^(-rT), which S = F, q = r produces, and
+the drift r - q becomes 0. The PDE says the same: the (r - q) S V_S carry term
+vanishes because a futures hedge costs nothing to hold. One formula means one place
+for bugs, and every fix reaches both pricers.
+Interview answer (2 sentences): Black-Scholes is really a formula in the prepaid
+forward, so Black-76 is the same formula with the stock's prepaid forward S e^(-qT)
+replaced by the future's F e^(-rT), which is exactly q = r. I implement it as a
+one-line delegation and test it against Black's formula written out independently
+plus Hull's worked example, because a test comparing the wrapper with itself could
+never fail.
+Reference: Black (1976), J. Financial Economics 3; Hull, "Futures options and
+Black's model" chapter; Haug, The Complete Guide to Option Pricing Formulas, ch. 1
+(generalised Black-Scholes).
+
+## Zero total volatility: explicit branch for the price, true limits for d1/d2: DRAFT
+Chose: where sigma sqrt(T) = 0, `bs_price` returns the discounted forward intrinsic
+value max(S e^(-qT) - K e^(-rT), 0) (puts mirrored), which is also the lower
+no-arbitrage bound; at T = 0 this is ordinary intrinsic value. `d1_d2` separately
+returns the true limits: +inf if P_S > P_K, -inf if P_S < P_K, and 0 at the forward
+(d1 = -d2 = sigma sqrt(T)/2 -> 0).
+Alternatives considered: letting the division produce +/-inf and trusting
+N(+/-inf) (the legacy approach: right by accident except NaN at the forward, and a
+warning every time); returning max(S - K, 0) (wrong whenever r or q is non-zero).
+Why: the limit is decided by moneyness against the forward, P_S vs P_K, not S vs K.
+The explicit branch gives an exact, never-negative price; using the d1 = d2 = 0
+limit instead would give 0.5 (P_S - P_K), which rounding can make slightly negative.
+d1_d2 still carries the limits because the Greeks use d1/d2 directly: delta then
+becomes the correct step function at sigma = 0, with 0.5 at the forward. A planted
+bug (d1/d2 = NaN at the forward) failed only the d1_d2 test, not the price tests,
+which is the explicit branch doing its job.
+Interview answer (2 sentences): As sigma sqrt(T) goes to 0, d1 goes to plus or
+minus infinity depending on whether the prepaid forward is above or below the
+discounted strike, so the price tends to the discounted forward intrinsic value,
+except exactly at the forward where d1 is 0/0. I branch explicitly to that limit
+instead of relying on infinities, which removes the NaN my old calculator returned
+there.
+Reference: Hull, "Black-Scholes-Merton model" chapter (properties of the formula as
+sigma -> 0 and T -> 0); legacy audit finding #1 above.
+
+## Invalid inputs return NaN, never raise: DRAFT
+Chose: S <= 0, K <= 0, T < 0, sigma < 0, or any NaN/inf input gives NaN in that
+position of the output, with no exception and no warning. Other positions in the
+same array are unaffected. `is_call` of the wrong type still raises TypeError.
+Alternatives considered: raise ValueError on any invalid element (one bad scenario
+aborts a 10,000-scenario revaluation); leave it unchecked (negative sigma fails the
+`v > 0` test and is silently priced as zero vol).
+Why: invalid values can come from my own pipeline, not just typos: a "vol -25
+points" stress on a 20% vol gives sigma = -5%, and a Newton step can overshoot below
+0. Silently pricing that as sigma = 0 would make a stress report look clean. NaN
+cannot pass for a price and propagates into any sum, so it surfaces. A wrong type
+for is_call is a programming error, so it stops the program instead. Matches the
+IV-solver rule in CLAUDE.md (NaN outside bounds, never raise inside a vectorised
+call).
+Interview answer (2 sentences): In a vectorised pricer, an invalid input such as a
+negative vol from an oversized stress shock returns NaN for that element only, so
+the run completes and the bad scenario is visible rather than silently priced as
+zero vol. I distinguish that from programming errors like a non-boolean is_call,
+which raise immediately.
+Reference: IEEE 754 NaN propagation; NumPy documentation, "Floating point error
+handling" (numpy.errstate).
+
+## is_call required, keyword-only, strictly boolean; scalars return float: DRAFT
+Chose: `is_call` has no default, must be passed by keyword, and must be a bool or
+bool array (`is_call=1`, `"C"`, `"P"` raise TypeError). A scalar result is returned
+as a built-in Python float; array results stay float64 arrays.
+Alternatives considered: `is_call=True` default; accepting any truthy value;
+returning 0-d arrays or np.float64 for scalars.
+Why: a put priced as a call is a silent, costly error, and `"P"` is truthy in
+Python. Keyword-only makes every call site read `is_call=False` explicitly. A plain
+float prints and serialises cleanly (NumPy 2 prints np.float64(4.76)); the cost is
+that the caller's own arithmetic follows Python rules (1/0.0 raises).
+Interview answer (2 sentences): I made the call/put flag mandatory, keyword-only
+and strictly boolean, because in Python the string "P" is truthy and would silently
+price a put as a call. Scalar inputs return a plain float and arrays return arrays,
+so the same function serves a dashboard and a scenario engine.
+Reference: Python docs, Built-in Types, "Truth Value Testing"; NumPy 2.0 release notes
+(scalar representation, NEP 51).
+
+## Normal CDF: scipy.special.ndtr, and N(-x) computed directly: DRAFT
+Chose: `ndtr` for N(x); the put formula evaluates N(-d1), N(-d2) directly rather
+than 1 - N(d1), 1 - N(d2).
+Alternatives considered: `scipy.stats.norm.cdf` (same values, extra Python-level
+overhead per call); `1 - N(x)`.
+Why: for large positive x, N(x) rounds to 1.0 and 1 - N(x) becomes 0, losing a
+small but real value. N(-x) is computed accurately in the tail, which keeps deep
+OTM puts positive and correct.
+Interview answer (2 sentences): I evaluate N(-x) directly because 1 - N(x)
+suffers catastrophic cancellation in the tails, where N(x) is within an ulp of 1. I
+call scipy.special.ndtr rather than scipy.stats.norm.cdf because it is the same
+function without the distribution-object overhead, which matters when revaluing
+thousands of scenarios.
+Reference: Higham, Accuracy and Stability of Numerical Algorithms, ch. 1
+(cancellation); SciPy documentation, scipy.special.ndtr.
+
+## Element-wise special cases: np.where with safe placeholders: DRAFT
+Chose: compute both branches for the whole array and select with `np.where`; before
+any division, log or square root, replace the positions that will be discarded with
+harmless valid values (`v_safe` = 1 where sigma sqrt(T) = 0; `_sanitise` puts
+S = K = T = sigma = 1, r = q = 0 where inputs are invalid), then overwrite those
+positions with the limit value or NaN.
+Alternatives considered: a Python `if` per element (loses vectorisation);
+`np.errstate` to silence the warnings (hides the symptom and still computes 0/0);
+masked arrays (heavier, and every later operation must respect the mask).
+Why: `np.where(cond, A, B)` evaluates all of A and all of B before selecting, so
+the unused branch still runs. The same mask builds the placeholders and makes the
+final selection, so a placeholder result can never reach the output.
+Interview answer (2 sentences): NumPy's where evaluates both branches on every
+element, so I substitute safe placeholder values wherever a branch will be discarded,
+which keeps the computation warning-free without silencing warnings globally. The
+same mask chooses the output, so the placeholder results are always overwritten by
+the correct limit or by NaN.
+Reference: NumPy documentation, numpy.where (both inputs are evaluated) and
+numpy.errstate.
