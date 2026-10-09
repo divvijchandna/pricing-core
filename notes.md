@@ -224,3 +224,114 @@ same mask chooses the output, so the placeholder results are always overwritten 
 the correct limit or by NaN.
 Reference: NumPy documentation, numpy.where (both inputs are evaluated) and
 numpy.errstate.
+
+## Greeks API: one function per Greek, is_call only where it matters: DRAFT
+Chose: `delta`, `gamma`, `vega`, `theta`, `rho`, `vanna`, `volga`, each with the
+`bs_price` signature. `delta`, `theta` and `rho` take a required keyword-only
+`is_call`; `gamma`, `vega`, `vanna` and `volga` take none. Internal units: per 1.00
+of the bumped quantity, theta per year with theta = dV/dt = -dV/dT; reporting
+conversions live in `conventions` (`per_day` = /365 calendar days, `per_vol_point`
+= /100).
+Alternatives considered: one function returning all Greeks (saves recomputing d1/d2
+seven times, but no caller needs that yet); a uniform signature where every Greek
+takes is_call (a flag that changes nothing misleads the reader).
+Why: each Greek is a short formula with its own docstring and units and is tested
+on its own. Gamma, vega, vanna and volga are equal for calls and puts because
+C - P = S e^(-qT) - K e^(-rT) is linear in S and independent of sigma, so any
+derivative that is second order in S or involves sigma cancels in C - P.
+Interview answer (2 sentences): I expose one function per Greek in internal units,
+per year for theta and per 1.00 of vol for vega, with separate helpers for desk
+units such as per day and per vol point. The call/put flag appears only on delta,
+theta and rho, because put-call parity makes the others identical for calls and
+puts.
+Reference: Hull, "The Greek letters" chapter; put-call parity (entry above).
+
+## Black-76 Greeks: reuse the BS functions, except rho: DRAFT
+Chose: Black-76 Greeks come from the BS functions with S = F and q = r (delta is then
+dV/dF, theta holds F fixed), except rho, which has its own `black76_rho` = -T V.
+Alternatives considered: a full set of black76_* functions (seven wrappers, six of
+them one-line delegations).
+Why: with q tied to r, `rho(F, K, T, r, r, sigma)` differentiates only the explicit
+r while holding q fixed, which is the wrong partial derivative. In Black-76 r only
+discounts, V = e^(-rT) [F N(d1) - K N(d2)], so with F fixed dV/dr = -T V. Tested
+against -T V exactly and against a bumped black76_price.
+Interview answer (2 sentences): Black-76 shares every Greek with Black-Scholes under
+S = F, q = r, except rho, because tying q to r means the rate also moves the carry
+term that the spot rho holds fixed. With the futures price held fixed, the rate only
+discounts the payoff, so Black-76 rho is simply minus T times the price.
+Reference: Black (1976); Hull, "Futures options and Black's model" chapter.
+
+## Greeks at zero total volatility: DRAFT
+Chose: where sigma sqrt(T) = 0 (zero vol, or expiry day), away from the forward each
+Greek takes its exact limit: delta and rho are step functions, theta is the carry
+q P_S - r P_K or 0, and gamma, vega, vanna, volga are 0. At the forward (P_S = P_K)
+delta and rho take the midpoint (d1 = d2 = 0), vega its one-sided limit
+P_S n(0) sqrt(T), and gamma, vanna, volga and theta return NaN.
+Alternatives considered: NaN for every Greek at zero vol (an expired deep ITM
+position would make book-level gamma totals NaN); +inf for gamma at the forward
+(true, but inf - inf in later aggregation gives NaN anyway, less explicitly).
+Why: the value max(P_S - P_K, 0) has a kink at the forward. Away from it, the
+Greeks are well-defined and an expiring book needs them (delta 1 or 0 for hedging,
+gamma 0). At the kink, gamma is a Dirac spike and at-the-money theta tends to -inf
+at expiry, so no finite number is honest. The midpoint for delta is the average of
+the left and right slopes, the usual convention.
+Interview answer (2 sentences): On expiry day an option's value becomes
+max(forward - strike, 0), so away from the strike the Greeks have clean limits such
+as delta of exactly 1 or 0 and zero gamma, which keeps book-level aggregates usable.
+Exactly at the strike the kink makes gamma infinite and theta unbounded, so those
+return NaN while delta takes the midpoint, one half.
+Reference: Hull, "The Greek letters" chapter (behaviour of gamma and theta as
+T -> 0).
+
+## Bump sizes and tolerances: truncation vs roundoff: DRAFT
+Chose: kept the CLAUDE.md bumps (spot h = 1e-4 S; vol, T and r h = 1e-4, central
+differences) and set each Greek's tolerance from data: rtol = 4 x the worst relative
+error measured on the 480-point grid (1e-5 to 6e-4), plus an atol for values near
+zero (1e-9 to 2e-5).
+Alternatives considered: PLAN.md's rtol ~1e-6 (fails: measured errors reach 1e-4 at
+sigma = 0.05); bumps scaled to the natural length, h_S = 1e-3 S sigma sqrt(T)
+(about 1e-6 everywhere, but changes the convention and needs extra roundoff care at
+small sigma); restricting the test to sigma sqrt(T) >= 0.1 (leaves low vol
+untested).
+Why: central-difference error = truncation h^2 |V'''| / 6 + roundoff eps |V| / h
+(second derivatives: h^2 |V''''| / 12 + 4 eps |V| / h^2, eps = 2.2e-16). The price
+curves over a spot range of about S sigma sqrt(T), so the relative truncation error
+is about (h / (S sigma sqrt(T)))^2: 1e-8 at sigma sqrt(T) = 0.5 but 1e-5 at 0.025.
+Every worst case was at sigma = 0.05. At the zero crossings of vanna (d2 = 0) and
+volga (d1 d2 = 0) the bumped value is pure roundoff, 4 eps V / h^2 ~ 1e-5 for volga,
+so only an absolute floor can work there. The resulting tolerances still sit ~1000x
+below the O(1) errors that real formula bugs produce, and the exact identities
+check the formulas far more tightly.
+Interview answer (2 sentences): A finite-difference Greek has truncation error that
+grows with the bump relative to how sharply the price curves, about S sigma sqrt(T)
+in spot, and roundoff error that grows as the bump shrinks, so short-dated low-vol
+options need either smaller bumps or looser tolerances. I measured the errors across
+the grid and set tolerances from the data, with absolute floors where Greeks such as
+vanna and volga cross zero.
+Reference: Higham, Accuracy and Stability of Numerical Algorithms, ch. 1;
+Glasserman, Monte Carlo Methods in Financial Engineering, ch. 7 (finite-difference
+sensitivities, bias vs variance of the bump).
+
+## Testing Greeks with both bumps and exact identities: DRAFT
+Chose: two independent kinds of test. (1) Each Greek against a central difference
+of bs_price (independent of my derivations, loose tolerance). (2) Exact identities
+at ~1e-10: Delta_C - Delta_P = e^(-qT), Theta_C - Theta_P = q P_S - r P_K,
+Rho_C - Rho_P = K T e^(-rT), the PDE Theta + (r - q) S Delta + 1/2 sigma^2 S^2
+Gamma - r V = 0, and vega = S^2 sigma T Gamma. Plus signs (gamma, vega >= 0) and a
+units check, per_day(theta) ~ V(T - 1 day) - V(T).
+Alternatives considered: bumps only (cannot detect errors smaller than their
+tolerance); identities only (blind to some bugs).
+Why: each kind has blind spots the other covers. A planted bug using N(d1) instead
+of N(d2) in rho still satisfies Rho_C - Rho_P = K T e^(-rT), because
+N(x) + N(-x) = 1 for any x, so only the bumped test caught it. Conversely the PDE
+and parity identities check delta, gamma, theta and the price against each other at
+1e-10, far tighter than any bump. Planted bugs in delta (missing e^(-qT)) and theta
+(sign of the q term) failed five or six tests each.
+Interview answer (2 sentences): I test analytic Greeks two ways: against finite
+differences of the price, which are independent but loose, and against exact
+identities like put-call relations and the Black-Scholes PDE, which are tight but
+can be satisfied by a wrong formula. A deliberately wrong rho passed the parity
+identity and was caught only by the bump test, which is why I keep both.
+Reference: Hull, "The Greek letters" chapter (relationship between delta, theta and
+gamma); Wilmott, Paul Wilmott Introduces Quantitative Finance, ch. on the
+Black-Scholes PDE.
