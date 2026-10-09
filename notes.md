@@ -335,3 +335,110 @@ identity and was caught only by the bump test, which is why I keep both.
 Reference: Hull, "The Greek letters" chapter (relationship between delta, theta and
 gamma); Wilmott, Paul Wilmott Introduces Quantitative Finance, ch. on the
 Black-Scholes PDE.
+
+## Implied vol: OTM conversion, bracket split at sigma*, safeguarded Newton: DRAFT
+Chose: `implied_vol(price, S, K, T, r, q, *, is_call, max_iter=100)`. (1) Convert
+the price by parity to the out-of-the-money option (call if P_S <= P_K, else put)
+and solve there. (2) Evaluate the price at sigma* = sqrt(2 |x| / T), x = ln(P_S/P_K):
+if it is above the target, the root is below sigma*, the bracket is [0, sigma*] and
+Newton starts at sigma*; otherwise the bracket is [sigma*, 5] and the start is the
+Brenner-Subrahmanyam estimate sqrt(2 pi / T) price / P_S (midpoint if it falls
+outside the bracket). (3) Newton steps, with the bracket shrunk every iteration by
+the sign of C(sigma) - target; bisect when vega < 1e-8 S or the step leaves the
+bracket. (4) Stop at |C - target| <= 1e-12 target or a bracket a few ulps wide.
+NaN for prices on or outside the bounds (including exactly at the lower bound, i.e.
+sigma = 0), T = 0, invalid inputs, roots above sigma = 5, and anything not converged
+within max_iter.
+Alternatives considered: plain Newton from a fixed start (diverges or leaves
+sigma > 0 for far-from-the-money options); pure bisection or Brent (always
+converges, but 30-50 iterations); Jaeckel's "Let's Be Rational" (see next entry);
+returning the last iterate when not converged (a wrong number that looks right).
+Why: the price is convex in sigma below sigma* and concave above it (volga =
+vega d1 d2 / sigma changes sign where d1 d2 = 0, i.e. at sigma*), so Newton from
+sigma* approaches the root monotonically without overshooting. Near the money
+sigma* -> 0, so Brenner-Subrahmanyam (exact to first order at the forward, where
+C ~ P_S sigma sqrt(T) / sqrt(2 pi)) is the better start above sigma*. The bracket
+turns this into a guaranteed method: a stress sample found 18 of 27,337 cases
+where unguarded Newton, creeping down a flat tail, took a rounding-sized step to
+sigma <= 0.
+Interview answer (2 sentences): My solver converts any price to the
+out-of-the-money side by parity, then runs Newton from the inflection point of
+price in vol, where convexity guarantees no overshoot, or from the
+Brenner-Subrahmanyam estimate near the money. A bracket that shrinks every step
+falls back to bisection whenever Newton misbehaves, so it always converges or
+returns NaN, never a wrong vol.
+Reference: Brenner and Subrahmanyam (1988), Financial Analysts Journal 44(5);
+Jaeckel (2015), "Let's Be Rational", Wilmott; Press et al., Numerical Recipes,
+3rd ed., section 9.4 (rtsafe).
+
+## Newton vs Brent vs Let's Be Rational: DRAFT
+Chose: safeguarded Newton (previous entry).
+Alternatives considered: Brent's method (bracketing, no derivative needed,
+guaranteed, superlinear); Jaeckel's "Let's Be Rational" (rational transformation of
+the price function so that a Householder iteration converges to machine precision
+in about two iterations everywhere).
+Why: we have vega analytically, so Newton's quadratic convergence is free, and the
+bracket gives Brent-like robustness. Measured on a 50,000-option stress sample
+(moneyness e^(+/-1), T from 0.01 to 3.2 years, sigma 2% to 200%): fraction of
+solvable options converged by max_iter 5 / 10 / 20 / 30 / 50 = 45% / 76% / 97% /
+99.97% / 100%; all 50,000 in 0.34 s vectorised. That is slower than textbook Newton
+(4-6 iterations near the money): roots far below sigma* sit in an exponentially
+flat tail, where Newton from sigma* is monotone but only about linearly convergent.
+Let's Be Rational exists to remove exactly that weakness; it is the upgrade path if
+IV becomes a bottleneck (e.g. fitting surfaces in the market maker), not needed in
+Week 1.
+Interview answer (2 sentences): I use Newton with analytic vega inside a shrinking
+bracket, which is robust and converged every solvable case in a 50,000-option stress
+test, but it needs up to about 50 iterations deep in the wings, where the price is
+exponentially flat in vol. Jaeckel's Let's Be Rational transforms the problem so two
+iterations reach machine precision everywhere, and it is the method I would move to
+if implied vol became a bottleneck.
+Reference: Brent (1973), Algorithms for Minimization without Derivatives, ch. 4;
+Jaeckel (2015), "Let's Be Rational", Wilmott; Jaeckel (2006), "By Implication",
+Wilmott.
+
+## Why the IV round trip is ill-conditioned deep ITM and OTM: DRAFT
+Chose: test the round trip sigma -> price -> sigma only where vega > 1e-8 S, with a
+per-point tolerance from conditioning: (1e-10 * otm_price + 100 eps * |price|) /
+vega + 1e-12; and a price-space check that any returned sigma reprices to the input.
+Alternatives considered: one fixed tolerance on sigma (either too loose near the
+money or impossible in the wings); testing only near the money (hides the hard
+cases).
+Why: d_sigma ~ d_price / vega. Deep ITM or OTM, vega -> 0, so a tiny price error
+becomes a large vol error. Two price errors matter: the solver's (relative to the
+OTM price, i.e. the time value, which is what it solves for) and rounding already in
+the input (an ITM price is only accurate to ~eps x itself, intrinsic value
+included, which no solver can undo). This is also why the solver works on the OTM
+side: an ITM price's rounding error can exceed the whole time value. The tolerance
+was checked against a deliberately wrong solver that skipped the OTM conversion; it
+failed. In the far tails (prices ~1e-127) the price is so sensitive to sigma that a
+sigma correct to ~1e-12 reprices ~1e-10 off, so the price-space check allows
+vega * 1e-12.
+Interview answer (2 sentences): Implied vol is the inverse of price in vol, so its
+condition number is roughly 1/vega: deep in or out of the money vega vanishes and
+any price rounding is amplified into a large vol error. That is why I invert on the
+out-of-the-money side, where the price is pure time value, and why my round-trip
+tolerances scale as price error over vega rather than being a fixed number.
+Reference: Higham, Accuracy and Stability of Numerical Algorithms, ch. 1
+(conditioning); Jaeckel (2006), "By Implication", Wilmott.
+
+## Testing a solver with a fixed-seed stress sample: DRAFT
+Chose: besides grid round trips and NaN rules, one test over 50,000 random options
+(fixed seed, wider ranges than the grid) asserting (1) every option with usable vega
+is solved to the round-trip tolerance and (2) no returned sigma is wrong: every
+non-NaN answer reprices to the input.
+Alternatives considered: hand-picked hard cases (fragile: they depend on exact
+floating-point inputs); the grid only.
+Why: four planted bugs were run against the test suite. Skipping the OTM
+conversion, accepting the lower bound, and returning unconverged guesses were each
+caught by targeted tests, but removing the bracket safeguard passed every targeted
+test, because Newton from sigma* is monotone in exact arithmetic. Only the stress
+sample exposed it. The "never wrong" check matters more than the solve rate: NaN is
+an honest answer, a plausible wrong vol is not.
+Interview answer (2 sentences): I validate the implied-vol solver with a seeded
+stress test over 50,000 random options, requiring every solvable case to round-trip
+and every returned vol to reprice the input exactly. It caught a missing safeguard
+that all my hand-written edge-case tests missed, because the failure needed a
+rounding-sized step in a flat tail that only shows up at scale.
+Reference: Claessen and Hughes (2000), "QuickCheck", ICFP (property-based
+testing); numpy.random.Generator documentation (seeded reproducibility).
