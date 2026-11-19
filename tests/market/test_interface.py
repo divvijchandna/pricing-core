@@ -115,3 +115,19 @@ def test_mismatched_shapes_are_rejected(kw):
 def test_tenors_must_be_positive_and_strictly_increasing(tenors):
     with pytest.raises(ValueError):
         _state(tenors=tenors)
+
+
+def test_negative_node_vol_gives_nan_not_its_absolute_value():
+    # Squaring would silently turn -5% into +5%; a large vol-down scenario can
+    # push a node below zero, and that state must show up as invalid.
+    m = _state(atm_vol=np.array([0.10, -0.05, 0.09]))
+    assert np.all(np.isnan(m.vol(np.array([TENORS[1], 0.5]))))
+
+
+@pytest.mark.parametrize("bad", [-0.05, np.nan])
+def test_bad_node_only_affects_brackets_that_contain_it(bad):
+    # Bad 2Y node: maturities up to the 3M-1Y bracket never touch it.
+    tenors = np.append(TENORS, 2.0)
+    m = _state(tenors=tenors, atm_vol=np.array([0.10, 0.08, 0.09, bad]))
+    assert np.all(np.isfinite(m.vol(np.array([0.0, 0.1, 0.25, 0.5]))))
+    assert np.all(np.isnan(m.vol(np.array([1.5, 5.0]))))
